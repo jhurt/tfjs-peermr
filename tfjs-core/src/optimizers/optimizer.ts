@@ -17,7 +17,7 @@
 
 import {dispose} from '../globals';
 import {variableGrads} from '../gradients';
-import {scalar} from '../ops/ops';
+import {scalar, tensor} from '../ops/ops';
 import {Serializable} from '../serialization';
 import {Scalar, Variable} from '../tensor';
 import {NamedTensor, NamedTensorMap} from '../tensor_types';
@@ -71,6 +71,165 @@ export abstract class Optimizer extends Serializable {
     // Dispose gradients.
     dispose(grads);
 
+    if (returnCost) {
+      return value;
+    } else {
+      value.dispose();
+      return null;
+    }
+  }
+
+  /**
+   * Executes `f()` and minimizes the scalar output of `f()` by computing
+   * gradients of y with respect to the list of trainable variables provided by
+   * `varList`. If no list is provided, it defaults to all trainable variables.
+   *
+   * @param f The function to execute and whose output to minimize.
+   * @param returnCost Whether to return the scalar cost value produced by
+   * executing `f()`.
+   * @param varList An optional list of variables to update. If specified, only
+   * the trainable variables in varList will be updated by minimize. Defaults to
+   * all trainable variables.
+   *
+   * @param peermrContext
+   * @doc {heading: 'Training', subheading: 'Optimizers'}
+   */
+  async minimizeAllReduce(f: () => Scalar,
+                          returnCost = false,
+                          varList?: Variable[],
+                          // tslint:disable-next-line:no-any
+                          peermrContext?: any | undefined):
+    Promise<Scalar | null> {
+    if (!peermrContext) {
+      return this.minimize(f, returnCost, varList);
+    }
+
+    // compute gradients
+    peermrContext.log(`compute gradients start`);
+    const {value, grads} = this.computeGradients(f, varList);
+    const varNames = Object.keys(grads);
+    const nameToN: Map<string, number> = new Map<string, number>();
+    const participatingVarNames: string[] = [];
+    for (const name of varNames) {
+      nameToN.set(name, 1);
+      if (grads[name] !== null) {
+        participatingVarNames.push(name);
+      }
+    }
+    peermrContext.log(`compute gradients end`);
+
+    // synchronize on iteration count
+    peermrContext.log(`vote start ${this.iterations_ || 0}`);
+    const globalMaxIterations =
+      await peermrContext.vote('iterations', this.iterations_ || 0);
+    peermrContext.log(`vote end ${globalMaxIterations}`);
+
+    const workerCount = peermrContext.getWorkerCount();
+    const sendRecvOptions = {'direct': true, 'timeout': 30_000};
+    const rank: number = peermrContext.getRank();
+    // perform allreduce
+    let receiveBuffers = [];
+    for (let i = 0; i < workerCount - 1; i++) {
+      const promises = [];
+      for (let j = 0; j < participatingVarNames.length; j++) {
+        const name = participatingVarNames[j];
+        const tag = [name, i, globalMaxIterations].join('-');
+        // send gradients to right neighbor
+        if (i === 0) {
+          // send this node's gradients to right neighbor
+          const gradientsData = await grads[name].data();
+          promises.push(peermrContext.sendToRank(
+            rank + 1, tag, gradientsData.buffer, sendRecvOptions));
+        } else if (receiveBuffers.length > j) {
+          // send gradients received from left neighbor to right neighbor
+          promises.push(peermrContext.sendToRank(
+            rank + 1, tag, receiveBuffers[j], sendRecvOptions));
+        } else {
+          // did not receive left neighbor's gradients
+          // send an averaged gradients
+          const gradients = grads[name];
+          const N = scalar(nameToN.get(name), grads[name].dtype);
+          const sendGradients = gradients.div(N);
+          const gradientsData = await sendGradients.data();
+          dispose(gradients);
+          dispose(N);
+          dispose(sendGradients);
+          promises.push(peermrContext.sendToRank(
+            rank + 1, tag, gradientsData.buffer, sendRecvOptions));
+        }
+
+        // receive gradients from left neighbor
+        promises.push(peermrContext.receiveFromRank(
+          rank - 1, tag, sendRecvOptions));
+      }
+
+      try {
+        peermrContext.log(
+          `gradients send/recv start ${i}-${globalMaxIterations}`);
+        // tslint:disable-next-line:no-any
+        const results: any = await Promise.all(promises);
+        peermrContext.log(
+          `gradients send/recv end ${i}-${globalMaxIterations}`);
+        receiveBuffers = [];
+        peermrContext.log(`gradients add start ${i}-${globalMaxIterations}`);
+        for (let j = 0; j < participatingVarNames.length; j++) {
+          receiveBuffers.push(results[(j * 2) + 1]);
+          const name = participatingVarNames[j];
+          nameToN.set(name, nameToN.get(name) + 1);
+          // convert received ArrayBuffer into appropriate TypedArray
+          let receivedTypedArray: Float32Array | Int32Array | Uint8Array;
+          const gradients = grads[name];
+          switch (gradients.dtype) {
+            case 'float32':
+            case 'complex64':
+              receivedTypedArray = new Float32Array(receiveBuffers[j]);
+              break;
+            case 'int32':
+              receivedTypedArray = new Int32Array(receiveBuffers[j]);
+              break;
+            case 'bool':
+            case 'string':
+            default:
+              receivedTypedArray = new Uint8Array(receiveBuffers[j]);
+          }
+          // create tensor gradient from the received TypedArray
+          const receivedGradients =
+            tensor(receivedTypedArray, gradients.shape, gradients.dtype);
+          // add received gradients to this node's gradients
+          grads[name] = gradients.add(receivedGradients);
+          dispose(gradients);
+          dispose(receivedGradients);
+        }
+        peermrContext.log(`gradients add end ${i}-${globalMaxIterations}`);
+      } catch (e) {
+        peermrContext.log(`gradients[${i}][${globalMaxIterations}] failed send and receive: ${e}`);
+        receiveBuffers = [];
+      }
+    }
+
+    // average the summed gradients
+    peermrContext.log(`gradients average start ${globalMaxIterations}`);
+    for (const name of participatingVarNames) {
+      const gradients = grads[name];
+      const N = scalar(nameToN.get(name), gradients.dtype);
+      grads[name] = gradients.div(N);
+      dispose(gradients);
+      dispose(N);
+      peermrContext.log(`gradients ${name} dtype: ${gradients.dtype}`);
+    }
+    peermrContext.log(`gradients average end ${globalMaxIterations}`);
+
+    peermrContext.log(`gradients apply start ${globalMaxIterations}`);
+    if (varList != null) {
+      const gradArray: NamedTensor[] =
+        varList.map(v => ({name: v.name, tensor: grads[v.name]}));
+      this.applyGradients(gradArray);
+    } else {
+      this.applyGradients(grads);
+    }
+    peermrContext.log(`gradients apply end ${globalMaxIterations}`);
+
+    dispose(grads);
     if (returnCost) {
       return value;
     } else {

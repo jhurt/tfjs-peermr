@@ -1295,8 +1295,10 @@ export class LayersModel extends Container implements tfc.InferenceModel {
    * 4. calculates the metrics
    * 5. returns the values of the losses and metrics.
    */
-  protected makeTrainFunction(): (data: Tensor[]) => Scalar[] {
-    return (data: Tensor[]) => {
+  // tslint:disable-next-line:no-any
+  protected makeTrainFunction(peermrContext?: any | undefined):
+      (data: Tensor[]) => Promise<Scalar[]> {
+    return async (data: Tensor[]) => {
       const lossValues: Scalar[] = [];
 
       const inputs = data.slice(0, this.inputs.length);
@@ -1374,8 +1376,8 @@ export class LayersModel extends Container implements tfc.InferenceModel {
       const variables = this.collectedTrainableWeights.map(
           param => param.read() as tfc.Variable);
       const returnCost = true;
-      const totalLossValue =
-          this.optimizer_.minimize(totalLossFunction, returnCost, variables);
+      const totalLossValue = await this.optimizer_.minimizeAllReduce(
+          totalLossFunction, returnCost, variables, peermrContext);
 
       return [totalLossValue].concat(metricsValues);
     };
@@ -1464,7 +1466,9 @@ export class LayersModel extends Container implements tfc.InferenceModel {
   async fit(
       x: Tensor|Tensor[]|{[inputName: string]: Tensor},
       y: Tensor|Tensor[]|{[inputName: string]: Tensor},
-      args: ModelFitArgs = {}): Promise<History> {
+      args: ModelFitArgs = {},
+      // tslint:disable-next-line:no-any
+      peermrContext?: any | undefined): Promise<History> {
     if (this.isTraining) {
       throw new Error(
           'Cannot start training because another fit() call is ongoing.');
@@ -1563,7 +1567,7 @@ export class LayersModel extends Container implements tfc.InferenceModel {
       //  function arguments. Since the function are defined below in the
       //  scope, we don't have equivalents of PyKeras's
       //  `_make_train_funciton`.
-      const trainFunction = this.makeTrainFunction();
+      const trainFunction = this.makeTrainFunction(peermrContext);
       const outLabels = this.getDedupedMetricsNames();
 
       let valFunction: (data: Tensor[]) => Scalar[];
@@ -1629,7 +1633,7 @@ export class LayersModel extends Container implements tfc.InferenceModel {
    * @returns A `History` object.
    */
   async fitLoop(
-      f: (data: Tensor[]) => Scalar[], ins: Tensor[], outLabels?:
+      f: (data: Tensor[]) => Promise<Scalar[]>, ins: Tensor[], outLabels?:
       string[], batchSize?: number, epochs?: number, verbose?: number,
       callbacks?: BaseCallback[], valF?: (data: Tensor[]) => Scalar[], valIns?:
       Tensor[], shuffle?: boolean|string, callbackMetrics?: string[],
@@ -1706,41 +1710,38 @@ export class LayersModel extends Container implements tfc.InferenceModel {
           const batchLogs: UnresolvedLogs = {};
           await callbackList.onBatchBegin(batchIndex, batchLogs);
 
-          tfc.tidy(() => {
-            const batchStart = batches[batchIndex][0];
-            const batchEnd = batches[batchIndex][1];
-            const batchIds = K.sliceAlongFirstAxis(
-                                 epochIndexArray1D, batchStart,
-                                 batchEnd - batchStart) as Tensor1D;
-            batchLogs['batch'] = batchIndex;
-            batchLogs['size'] = batchEnd - batchStart;
+          const batchStart = batches[batchIndex][0];
+          const batchEnd = batches[batchIndex][1];
+          const batchIds = K.sliceAlongFirstAxis(
+              epochIndexArray1D, batchStart,
+              batchEnd - batchStart) as Tensor1D;
+          batchLogs['batch'] = batchIndex;
+          batchLogs['size'] = batchEnd - batchStart;
 
-            // TODO(cais): In ins, train flag can be a number, instead of an
-            //   Tensor? Do we need to handle this in tfjs-layers?
-            const insBatch = sliceArraysByIndices(ins, batchIds) as Tensor[];
-            const outs = f(insBatch);
-            for (let i = 0; i < outLabels.length; ++i) {
-              const label = outLabels[i];
-              const out = outs[i];
-              batchLogs[label] = out;
-              tfc.keep(out);
-              // TODO(cais): Use scope() to avoid ownership.
-            }
+          // TODO(cais): In ins, train flag can be a number, instead of an
+          //   Tensor? Do we need to handle this in tfjs-layers?
+          const insBatch = sliceArraysByIndices(ins, batchIds) as Tensor[];
+          batchIds.dispose();
+          const outs = await f(insBatch);
+          for (let i = 0; i < outLabels.length; ++i) {
+            const label = outLabels[i];
+            const out = outs[i];
+            batchLogs[label] = out;
+            // TODO(cais): Use scope() to avoid ownership.
+          }
 
-            if (batchIndex === batches.length - 1) {  // Last batch.
-              if (doValidation) {
-                const valOuts = this.testLoop(valF, valIns, batchSize);
-                // Porting Notes: In tfjs-layers, valOuts is always an Array.
-                for (let i = 0; i < outLabels.length; ++i) {
-                  const label = outLabels[i];
-                  const out = valOuts[i];
-                  tfc.keep(out);
-                  // TODO(cais): Use scope() to avoid ownership.
-                  epochLogs['val_' + label] = out;
-                }
+          if (batchIndex === batches.length - 1) {  // Last batch.
+            if (doValidation) {
+              const valOuts = this.testLoop(valF, valIns, batchSize);
+              // Porting Notes: In tfjs-layers, valOuts is always an Array.
+              for (let i = 0; i < outLabels.length; ++i) {
+                const label = outLabels[i];
+                const out = valOuts[i];
+                // TODO(cais): Use scope() to avoid ownership.
+                epochLogs['val_' + label] = out;
               }
             }
-          });
+          }
 
           await callbackList.onBatchEnd(batchIndex, batchLogs);
           disposeTensorsInLogs(batchLogs);
@@ -1819,14 +1820,16 @@ export class LayersModel extends Container implements tfc.InferenceModel {
   async trainOnBatch(
       x: Tensor|Tensor[]|{[inputName: string]: Tensor},
       y: Tensor|Tensor[]|
-      {[inputName: string]: Tensor}): Promise<number|number[]> {
+      {[inputName: string]: Tensor},
+      // tslint:disable-next-line:no-any
+      peermrContext?: any | undefined): Promise<number|number[]> {
     // TODO(cais): Support sampleWeight and classWeight.
     // TODO(cais): Support Dataset objects.
     const standardizeOut = await this.standardizeUserData(x, y);
     const inputs = standardizeOut[0];
     const targets = standardizeOut[1];
-    const trainFunction = this.makeTrainFunction();
-    const losses = trainFunction(inputs.concat(targets));
+    const trainFunction = this.makeTrainFunction(peermrContext);
+    const losses = await trainFunction(inputs.concat(targets));
     const lossValues: number[] = [];
     for (const loss of losses) {
       const v = await loss.data();

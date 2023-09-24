@@ -867,13 +867,15 @@ export class Sequential extends LayersModel {
   override async fit(
       x: Tensor|Tensor[]|{[inputName: string]: Tensor},
       y: Tensor|Tensor[]|{[inputName: string]: Tensor},
-      args: ModelFitArgs = {}): Promise<History> {
+      args: ModelFitArgs = {},
+      // tslint:disable-next-line:no-any
+      peermrContext?: any | undefined): Promise<History> {
     if (!this.built) {
       throw new RuntimeError(
           'The model needs to be compiled before ' +
           'being used.');
     }
-    return this.model.fit(x, y, args);
+    return this.model.fit(x, y, args, peermrContext);
   }
 
   /**
