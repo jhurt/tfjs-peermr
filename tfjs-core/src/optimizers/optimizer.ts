@@ -15,7 +15,7 @@
  * =============================================================================
  */
 
-import {dispose} from '../globals';
+import {dispose, getBackend} from '../globals';
 import {variableGrads} from '../gradients';
 import {scalar, tensor} from '../ops/ops';
 import {Serializable} from '../serialization';
@@ -105,7 +105,8 @@ export abstract class Optimizer extends Serializable {
     }
 
     // compute gradients
-    peermrContext.log(`compute gradients start`);
+    peermrContext.log(`compute gradients start with ${getBackend()}`);
+
     const {value, grads} = this.computeGradients(f, varList);
     const varNames = Object.keys(grads);
     const nameToN: Map<string, number> = new Map<string, number>();
@@ -151,7 +152,6 @@ export abstract class Optimizer extends Serializable {
           const N = scalar(nameToN.get(name), grads[name].dtype);
           const sendGradients = gradients.div(N);
           const gradientsData = await sendGradients.data();
-          dispose(gradients);
           dispose(N);
           dispose(sendGradients);
           promises.push(peermrContext.sendToRank(
