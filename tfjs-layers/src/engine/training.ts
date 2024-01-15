@@ -1157,8 +1157,10 @@ export class LayersModel extends Container implements tfc.InferenceModel {
       const outputShape = this.feedOutputShapes[i];
       const lossFn = this.feedLossFns[i];
       if (lossFn === losses.sparseCategoricalCrossentropy) {
+        // outputShapes.push(
+        //     outputShape.slice(0, outputShape.length - 1).concat([1]));
         outputShapes.push(
-            outputShape.slice(0, outputShape.length - 1).concat([1]));
+            outputShape.slice(0, outputShape.length - 1));
       } else {
         // Porting Note: Because of strong typing `lossFn` must be a function.
         outputShapes.push(outputShape);
