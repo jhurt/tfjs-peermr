@@ -41,6 +41,7 @@ export interface OptimizerVariable {
 /** @doc {heading: 'Training', subheading: 'Classes', namespace: 'train'} */
 export abstract class Optimizer extends Serializable {
   protected iterations_: number;
+  protected previousMinimizeInvocation_: number;
 
   /**
    * Executes `f()` and minimizes the scalar output of `f()` by computing
@@ -104,8 +105,14 @@ export abstract class Optimizer extends Serializable {
       return this.minimize(f, returnCost, varList);
     }
 
+    if (this.previousMinimizeInvocation_) {
+      peermrContext.log(`forward pass took ${Date.now() - this.previousMinimizeInvocation_} ms`);
+      this.previousMinimizeInvocation_ = Date.now();
+    }
+
     // compute gradients
-    peermrContext.log(`compute gradients start with ${getBackend()}`);
+    peermrContext.log(`computing gradients using ${getBackend()} backend`);
+    const computeGradientsStart = Date.now();
 
     const {value, grads} = this.computeGradients(f, varList);
     const varNames = Object.keys(grads);
@@ -117,18 +124,23 @@ export abstract class Optimizer extends Serializable {
         participatingVarNames.push(name);
       }
     }
-    peermrContext.log(`compute gradients end`);
+    peermrContext.log(`compute gradients took ${Date.now() - computeGradientsStart} ms`);
 
     // synchronize on iteration count
     peermrContext.log(`vote start ${this.iterations_ || 0}`);
     const globalMaxIterations =
       await peermrContext.vote('iterations', this.iterations_ || 0);
+    if (this.iterations_ !== globalMaxIterations) {
+      this.iterations_ = globalMaxIterations;
+    }
     peermrContext.log(`vote end ${globalMaxIterations}`);
 
     const workerCount = peermrContext.getWorkerCount();
     const sendRecvOptions = {'direct': true, 'timeout': 30_000};
     const rank: number = peermrContext.getRank();
+
     // perform allreduce
+    const allreduceCommStart = Date.now();
     let receiveBuffers = [];
     for (let i = 0; i < workerCount - 1; i++) {
       const promises = [];
@@ -206,19 +218,22 @@ export abstract class Optimizer extends Serializable {
         receiveBuffers = [];
       }
     }
+    peermrContext.log(`allreduce communication took ${Date.now() - allreduceCommStart} ms`);
 
     // average the summed gradients
+    const allreduceAvgStart = Date.now();
     peermrContext.log(`gradients average start ${globalMaxIterations}`);
     for (const name of participatingVarNames) {
       const gradients = grads[name];
       const N = scalar(nameToN.get(name), gradients.dtype);
+      peermrContext.log(`gradients ${name}, dtype: ${gradients.dtype}, received count: ${nameToN.get(name)}`);
       grads[name] = gradients.div(N);
       dispose(gradients);
       dispose(N);
-      peermrContext.log(`gradients ${name} dtype: ${gradients.dtype}`);
     }
-    peermrContext.log(`gradients average end ${globalMaxIterations}`);
+    peermrContext.log(`gradients average took ${Date.now() - allreduceAvgStart} ms`);
 
+    const applyGradientsStart = Date.now();
     peermrContext.log(`gradients apply start ${globalMaxIterations}`);
     if (varList != null) {
       const gradArray: NamedTensor[] =
@@ -227,7 +242,7 @@ export abstract class Optimizer extends Serializable {
     } else {
       this.applyGradients(grads);
     }
-    peermrContext.log(`gradients apply end ${globalMaxIterations}`);
+    peermrContext.log(`gradients apply took ${Date.now() - applyGradientsStart} ms`);
 
     dispose(grads);
     if (returnCost) {
